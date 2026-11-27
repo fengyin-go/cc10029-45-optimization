@@ -42,6 +42,7 @@
         <tr>
           <th v-for="column in meta.fields" :key="column">{{ column }}</th>
           <th>当前状态</th>
+          <th>受理/缺料提示</th>
           <th>可执行动作</th>
         </tr>
       </thead>
@@ -49,7 +50,21 @@
         <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
+          <td class="recovery-hint" :data-testid="`hint-${row.id}`">
+            <strong v-if="row['受理结果']">{{ row['受理结果'] }}</strong>
+            <strong v-else-if="row['复盘受理结果']">{{ row['复盘受理结果'] }}</strong>
+            <span v-if="row['缺少资料']" class="missing-materials">缺：{{ row['缺少资料'] }}</span>
+            <span v-if="row['冲突提示']" class="conflict-hint">{{ row['冲突提示'] }}</span>
+          </td>
           <td class="row-actions">
+            <button
+              class="link"
+              type="button"
+              :data-testid="`edit-${row.id}`"
+              @click="openEdit(row)"
+            >
+              补资料/编辑
+            </button>
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -63,7 +78,7 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="meta.fields.length + 2" class="empty-state">
+          <td :colspan="meta.fields.length + 3" class="empty-state">
             暂无{{ meta.name }}数据，可先登记{{ meta.entity }}
           </td>
         </tr>
@@ -75,7 +90,7 @@
         <h3>登记{{ meta.entity }}</h3>
         <label v-for="field in meta.fields" :key="field" class="create-field">
           <span>{{ field }}</span>
-          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+          <input v-model="createValues[field]" :data-testid="`create-${field}`" :required="isRequiredField(field)" />
         </label>
         <div class="page-actions">
           <button class="btn" type="button" @click="showCreate = false">取消</button>
@@ -86,8 +101,26 @@
       </form>
     </div>
 
+    <div v-if="showEdit" class="modal-backdrop" data-testid="edit-modal">
+      <form class="modal" @submit.prevent="submitEdit">
+        <h3>补资料/编辑{{ meta.entity }} #{{ editingId }}</h3>
+        <p class="modal-tip">补齐主持人、会期等资料后保存，再执行“核准安排”等后续动作。</p>
+        <label v-for="field in editableFields" :key="field" class="create-field">
+          <span>{{ field }}</span>
+          <input v-model="editValues[field]" :data-testid="`edit-${field}`" />
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="showEdit = false">取消</button>
+          <button class="btn primary" data-testid="submit-edit" type="submit" :disabled="savingEdit">
+            {{ savingEdit ? '保存中…' : '保存并同步受理结果' }}
+          </button>
+        </div>
+      </form>
+    </div>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
+      <span v-if="noticeMessage" class="notice-text" data-testid="action-notice">{{ noticeMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
@@ -102,11 +135,19 @@ import {
   listEntries,
   moduleMeta,
   runAction as applyAction,
+  updateEntry,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const requiredFieldMap: Record<string, string[]> = {
+  quality_report: ['覆盖学期', '教学质量概况', '突出问题'],
+  review_meeting: ['会议主题', '参会人员'],
+}
+function isRequiredField(field: string): boolean {
+  return (requiredFieldMap[meta.key] ?? meta.fields).includes(field)
+}
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -115,9 +156,20 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const showEdit = ref(false)
+const savingEdit = ref(false)
+const editingId = ref<number | null>(null)
+const editValues = ref<Record<string, string>>({})
+const noticeMessage = ref('')
+const editableFields = computed(() => {
+  const preferred = ['主持人', '召开日期', '会期', '参会人员', '关联简报', '记录人员', '决议事项', '备注说明']
+  const fields = meta.fields.filter((field) => field !== '简报编号' || meta.key === 'quality_report')
+  return [...preferred.filter((field) => fields.includes(field)), ...fields.filter((field) => !preferred.includes(field))]
+})
+const pendingStatus = meta.key === 'review_meeting' ? '待签认' : meta.statuses[1]
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === pendingStatus).length },
   {
     label: meta.metrics[2],
     value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
@@ -165,11 +217,48 @@ async function submitCreate() {
   }
 }
 
+function openEdit(row: EntryRow) {
+  editingId.value = Number(row.id)
+  editValues.value = Object.fromEntries(
+    meta.fields.map((field) => [field, row[field] == null ? '' : String(row[field])]),
+  )
+  // 后端同时接受“会期”作为“召开日期”的业务别名。
+  if (!editValues.value['会期'] && row['召开日期']) {
+    editValues.value['会期'] = String(row['召开日期'])
+  }
+  noticeMessage.value = ''
+  errorMessage.value = ''
+  showEdit.value = true
+}
+
+async function submitEdit() {
+  if (editingId.value == null) return
+  savingEdit.value = true
+  errorMessage.value = ''
+  noticeMessage.value = ''
+  try {
+    const values = Object.fromEntries(
+      Object.entries(editValues.value).filter(([, value]) => value.trim() !== ''),
+    )
+    const result = await updateEntry(meta.key, editingId.value, values)
+    if (!result.ok) throw new Error(result.message)
+    noticeMessage.value = result.message
+    showEdit.value = false
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '保存失败'
+  } finally {
+    savingEdit.value = false
+  }
+}
+
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
+  noticeMessage.value = ''
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
+    noticeMessage.value = result.message
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'

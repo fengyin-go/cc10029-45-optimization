@@ -53,11 +53,43 @@ class BaseModuleService:
         rows = store.rows(self.MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
+        # 领域恢复字段（如申请编号、幂等键、快照）不一定出现在列表列中，
+        # 但登记时应允许调用方带入并持久化。
+        protected = {"id", "status", "pending", "abnormal"}
+        for key, value in values.items():
+            if key not in protected and key not in entry and value is not None:
+                entry[key] = value
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
         rows.append(entry)
         return entry, []
+
+    def update_entry(
+        self, entry_id: int, values: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """局部更新一条记录；子类可覆盖以同步跨模块状态。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, [f"{self.ENTITY} {entry_id} 不存在或已归档"]
+
+        protected = {"id"}
+        for key, value in (values or {}).items():
+            if key not in protected and value is not None:
+                entry[key] = value
+
+        missing = [
+            field for field in self.REQUIRED_FIELDS
+            if not str(entry.get(field) or "").strip()
+        ]
+        return entry, missing
+
+    def update(self, entry_id: int, values: dict[str, Any]):
+        """常见命名兼容，等价于 :meth:`update_entry`。"""
+        return self.update_entry(entry_id, values)
+
+    patch_entry = update
+    partial_update = update
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
